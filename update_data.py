@@ -154,6 +154,49 @@ def build_monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
     return summary
 
 
+def write_dataframe_in_chunks(ws, df: pd.DataFrame, max_cells_per_request: int = 400_000) -> None:
+    """
+    Write a dataframe to a worksheet in batches instead of one giant call.
+    A single ws.update() with millions of cells reliably triggers a
+    generic "APIError: 500 Internal error" from the Sheets API - this
+    keeps each request small enough to succeed, and retries transient
+    failures with backoff.
+    """
+    import time
+
+    import gspread
+
+    n_cols = max(len(df.columns), 1)
+    rows_per_chunk = max(1, max_cells_per_request // n_cols)
+
+    # header row first
+    ws.update(range_name="A1", values=[df.columns.tolist()])
+
+    values = df.values.tolist()
+    total_rows = len(values)
+    for start in range(0, total_rows, rows_per_chunk):
+        chunk = values[start : start + rows_per_chunk]
+        start_row = start + 2  # +1 for header, +1 because sheets are 1-indexed
+        range_name = f"A{start_row}"
+
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                ws.update(range_name=range_name, values=chunk)
+                break
+            except gspread.exceptions.APIError as exc:
+                if attempt >= 4:
+                    raise
+                wait = 5 * attempt
+                log(f"  Sheets API error on rows {start_row}-{start_row + len(chunk) - 1}, "
+                    f"retrying in {wait}s (attempt {attempt}/4): {exc}")
+                time.sleep(wait)
+
+        log(f"  Wrote rows {start_row}-{start_row + len(chunk) - 1} of {total_rows + 1}")
+        time.sleep(1.1)  # stay comfortably under Sheets API per-minute write quota
+
+
 def push_to_google_sheets(tables: dict) -> None:
     creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     spreadsheet_id = os.environ.get("SPREADSHEET_ID")
@@ -190,7 +233,7 @@ def push_to_google_sheets(tables: dict) -> None:
                 clean_df[col] = clean_df[col].dt.strftime("%Y-%m-%d")
         clean_df = clean_df.fillna("")
 
-        ws.update([clean_df.columns.tolist()] + clean_df.values.tolist())
+        write_dataframe_in_chunks(ws, clean_df)
 
     # stamp a "last updated" marker so the Tableau dashboard can show data freshness
     try:
